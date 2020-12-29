@@ -1,0 +1,5 @@
+tensorflow-gpu<2.4
+tensorflow-hub<2.4
+jupyter
+matplotlib
+seaborn
