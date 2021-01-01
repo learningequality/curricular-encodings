@@ -1,9 +1,12 @@
 import json
-from classes import Node, NodeSet
+from classes import Node, NodeList
 
 DEFAULT_FILENAME = "metadatadump.json"
 
 def load_data(filename=DEFAULT_FILENAME):
+
+    print("Loading data... ", end="")
+
     with open(filename) as f:
         data = {key: Node(fields) for key, fields in json.load(f).items()}
 
@@ -17,7 +20,12 @@ def load_data(filename=DEFAULT_FILENAME):
             node.parent = data[parent_id]
             node.parent.children.append(node)
 
-    return NodeSet(data)
+    for node in data.values():
+        node.children = NodeList(node.children)
+
+    print("Done!")
+
+    return NodeList(data.values())
 
 if __name__ == "__main__":
     data = load_data()

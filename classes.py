@@ -1,9 +1,21 @@
 import json
 import numpy as np
 import pandas as pd
-import random
+import itertools
+
+from numpy.random import choice
 
 from embedding_utils import embeddings
+
+
+def grouper(n, iterable):
+    it = iter(iterable)
+    while True:
+        chunk = tuple(itertools.islice(it, n))
+        if not chunk:
+            return
+        yield NodeList(chunk)
+
 
 class Node(object):
 
@@ -29,35 +41,56 @@ class Node(object):
         return super().__dir__() + self.fields.keys()
 
     def __repr__(self):
-        return json.dumps(self.fields, indent=2)
+        data = {attr: getattr(self, attr)() for attr in ["breadcrumbs", "studio_url"]}
+        data.update(self.fields)
+        return json.dumps(data, indent=2)
 
     def breadcrumbs(self, separator=" > "):
         prefix = (self.parent.breadcrumbs(separator=separator) + separator) if self.parent else ""
         return prefix + self.title
 
-    def embedding(self, key):
+    def get_embedding(self, key):
         assert key in embeddings
-        return embeddings[key].loc[self.index]        
+        return embeddings[key].loc[self.index]
+
+    def set_embedding(self, key, embedding):
+        embeddings[key].loc[self.index] = embedding
+
+    def studio_url(self):
+        if self.kind == "topic":
+            return f"https://studio.learningequality.org/channels/{self.channel_id}/edit/{self.id[:7]}"
+        else:
+            return f"https://studio.learningequality.org/channels/{self.channel_id}/edit/{self.parent.id[:7]}/{self.id[:7]}"
 
 
-class NodeSet(dict):
+class NodeList(list):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self._by_index = {n.index: n for n in self.values()}
-        self._by_id = {n.id: n for n in self.values()}
+        self._by_index = {n.index: n for n in self}
+        self._by_id = {n.id: n for n in self}
 
-    def by_index(self, indices):
-        return [self._by_index[index] for index in indices]
+    def by_indices(self, indices):
+        return NodeList([self._by_index[index] for index in indices])
+
+    def by_ids(self, ids):
+        return NodeList([self._by_id[id] for id in ids])
+
+    def by_content_ids(self, content_ids):
+        content_ids = set(content_ids)
+        return self.filter(lambda x: x.content_id in content_ids)
 
     def filter(self, fn):
-        return NodeSet({key: val for key, val in self.items() if fn(val)})
+        return NodeList([node for node in self if fn(node)])
+
+    def exclude(self, fn):
+        return NodeList([node for node in self if not fn(node)])
 
     def indices(self):
         return self.column("index")
 
     def column(self, key):
-        return [getattr(n, key) for n in self.values()]
+        return [getattr(n, key) for n in self]
 
     def embeddings(self, key):
         assert key in embeddings
@@ -70,80 +103,73 @@ class NodeSet(dict):
 
     def ranked_matches(self, other, self_key, other_key=None):
         scores = self.dot(other, self_key, other_key)
-        return [other.by_index(scores.loc[index].sort_values(ascending=False).index) for index in scores.index]
+        return [other.by_indices(scores.loc[index].sort_values(ascending=False).index) for index in scores.index]
 
-    def rankings_by_content_id_to_parent(self, other, self_key, other_key=None):
+    def ranked_matches_pd(self, other, self_key, other_key=None):
+        scores = self.dot(other, self_key, other_key)
+
+        return [other.by_indices(scores.loc[index].sort_values(ascending=False).index) for index in scores.index]
+
+    def rankings_by_content_id_to_parent(self, other, group, self_key, other_key=None, chunk_size=1000):
         # self = all topics; other = test/holdout content nodes
-        ranked_matches = self.ranked_matches(other, self_key, other_key)
-        ranked_dict = {index: matches for index, matches in zip(self.indices(), ranked_matches)}
 
-        befores = []
-        afters = []
-        percentiles = []
+        other_grouped = other.filter(lambda x: x.group == group)
+
+        dataframe = other.as_dataframe()
+
         rankings = []
 
-        # for each of the content nodes being tested
-        for node in other.values():
-            before = set()
-            after = set()
-            found = False
-            matches = ranked_dict[node.parent.index]
-            for match in matches:
-                # skip if parent is different language
-                # if match.lang_id != node.lang_id:
-                #     continue
-                if not found:
-                    if match.content_id == node.content_id:
-                        found = True
-                    else:
-                        before.add(match.content_id)
-                else:                
-                    if match.content_id != node.content_id and match.content_id not in before:
-                        after.add(match.content_id)
+        # chunk to keep the scores calculation from generating an OOM error
+        for chunk in grouper(chunk_size, other_grouped):
 
-            percentile = (len(before) + 1) / (len(before) + len(after) + 1)
-            rankings.append([percentile, len(before), len(after)])
+            chunk_indices = set(chunk.indices())
 
-        return pd.DataFrame(rankings, columns=["percentile", "before", "after"], index=other.indices())
+            parent_nodes = self.filter(lambda x: chunk_indices.intersection(x.children.indices()))
 
-    def rankings_of_group(data, group, field="em_title"):
+            scores = parent_nodes.dot(other_grouped, self_key, other_key)
+
+            # for each of the content nodes being tested
+            for node in chunk:
+
+                ranked_indices = scores.loc[node.parent.index].sort_values(ascending=False).index
+                content_ids = list(dataframe.loc[ranked_indices].content_id.unique())
+                position = content_ids.index(node.content_id)
+
+                percentile = position / len(content_ids)
+                rankings.append([percentile, position, len(content_ids) - position - 1, node.channel_id, node.lang_id, node.kind])
+
+        return pd.DataFrame(rankings, columns=["percentile", "before", "after", "channel", "language", "kind"], index=other_grouped.indices())
+
+    def ranked_matches_by_embedding(self, embedding, key, count=10, deduped=True):
+        scores = embeddings[key].loc[self.indices()].dot(embedding.T)
+        matches = self.by_indices(scores.sort_values(ascending=False, by=0).index)
+        results = []
+        content_ids = set()
+        for match in matches:
+            if deduped and match.content_id in content_ids:
+                continue
+            content_ids.add(match.content_id)
+            results.append(match)
+            if len(results) == count:
+                break
+        return results
+
+    def assign_groups(self, groups, inclusion_condition=lambda x: x.kind != "topic"):
         
-        befores = []
-        afters = []
-        percents = []
-        
-        grouped = [n for n in data.values() if n["group"] == group]
-        
-        for node in grouped:
-            before = set()
-            after = set()
-            found = False
-            matches = ranked_matches(node["parent"], grouped)
-            for match in matches:
-                if not found:
-                    if match["content_id"] == node["content_id"]:
-                        found = True
-                    else:
-                        before.add(match["content_id"])
-                else:                
-                    if match["content_id"] != node["content_id"]:
-                        after.add(match["content_id"])
-
-            befores.append(len(before))
-            afters.append(len(after))
-            percents.append((len(before) + 1) / (len(before) + len(after) + 1))
-
-        return np.mean(befores), np.mean(afters), np.mean(percents)
-
-    def assign_groups(self, holdout_fraction, test_fraction):
-        # holdout and test sets
-        # only assigning to content nodes, not topics
-        
-        for node in self.values():
+        for node in self.exclude(inclusion_condition):
             node.group = ""
-            if node.kind != "topic":
-                rand = random.random()
-                if rand <= holdout_fraction:
-                    node.group = "holdout"
-                elif rand <= (holdout_fraction + test_fraction):
-                    node.group = "test"
+
+        assert "" not in groups
+        names, probs = zip(*list(groups.items()))
+        assert sum(probs) < 1
+        names = [""] + list(names)
+        probs = [1 - sum(probs)] + list(probs)
+
+        for node in self.filter(inclusion_condition):
+            node.group = choice(names, 1, p=probs)[0]
+
+    def initialize_empty_embedding(self, key, length=512):
+        embeddings[key] = pd.DataFrame(np.zeros((len(self), length), dtype=np.float32), index=self.indices())
+
+    def as_dataframe(self):
+        return pd.DataFrame((node.fields for node in self), index=self.indices())

@@ -4,7 +4,9 @@ import tensorflow_text
 import numpy as np
 from collections import defaultdict
 from pandas import DataFrame
-import labse
+import os
+import pickle
+# import labse
 # import cmlm
 
 from functools import lru_cache
@@ -24,6 +26,28 @@ DEFAULT_MODEL = "useml3"
 DEFAULT_CHUNKSIZE = 1000
 
 embeddings = {}
+
+
+def save_embeddings():
+    print("Saving embeddings... ", end="")
+    with open("embeddings.pickle", "wb") as f:
+        pickle.dump(embeddings, f)
+    with open("embedding_cache.pickle", "wb") as f:
+        pickle.dump(embedding_cache, f)
+    print("Done!")
+
+
+def load_embeddings():
+    print("Loading embeddings... ", end="")
+    if os.path.isfile("embeddings.pickle") and os.path.isfile("embedding_cache.pickle"):
+        with open("embeddings.pickle", "rb") as f:
+            embeddings.update(pickle.load(f))
+        with open("embedding_cache.pickle", "rb") as f:
+            embedding_cache.update(pickle.load(f))
+        print("Done!")
+    else:
+        print("Pickle file doesn't exist; skipping load.")
+
 
 @lru_cache
 def get_embedder(model):
@@ -81,7 +105,7 @@ def embed(text, model=DEFAULT_MODEL, chunksize=DEFAULT_CHUNKSIZE, maxlength=200)
 def calculate_embeddings(data, fields=["title", "description"], model=DEFAULT_MODEL, chunksize=DEFAULT_CHUNKSIZE):
 
     for field in fields:
-        strings = [row[field] or "" for row in data.values()]
+        strings = data.column(field)
         embeddings[model_embedding_key(model, field)] = DataFrame(embed(strings, model=model, chunksize=chunksize), index=data.indices())
 
 
