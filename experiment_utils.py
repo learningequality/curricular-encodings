@@ -1,55 +1,152 @@
 from dataloading import *
 from embedding_utils import *
 from classes import *
-
-import numpy as np
-import matplotlib.pyplot as plt
-import seaborn as sns
-plt.ion()
-
-# MODEL = "use4"
-# MODEL = "useml3"
-# MODEL = "usel5"
-MODEL = "usem3"
-# MODEL = "l1"
-
-CHUNK_SIZE = 10000 if MODEL == "use4" else 1000
-
-data = load_data()#.filter(lambda x: x.index < 5000)
-
-
-load_embeddings()
-calculate_embeddings(data, fields=["title", "description"], model=MODEL)
-save_embeddings()
-
-topics = data.filter(lambda x: x.kind == "topic")
-content = data.filter(lambda x: x.kind != "topic")
-
-try:
-    with open("group_assignments.json") as f:
-        print("Loading group assignments... ", end="")
-        assignments = json.load(f)
-    for node in data:
-        node.group = assignments[node.id]
-except FileNotFoundError:
-    print("Generating and saving group assignments... ", end="")
-    content.assign_groups({"validation": 0.01, "testing": 0.01})
-    assignments = {node.id: node.group for node in data}
-    with open("group_assignments.json", "w") as f:
-        json.dump(assignments, f)
-print("Done!")
-
-validation = content.filter(lambda x: x.group == "validation")
-testing = content.filter(lambda x: x.group == "testing")
-excluded_content_ids = set(content.filter(lambda x: x.group != "").column("content_id"))
-excluded = content.filter(lambda x: x.group in ["", "excluded"] and x.content_id in excluded_content_ids)
-for node in excluded:
-    node.group = "excluded"
+from experiment_data_initialization import *
 
 
 def measure_performance(topic_key, content_key=None, topics=topics, content=content, group="testing"):
     rankings = topics.rankings_by_content_id_to_parent(content, group, self_key=topic_key, other_key=content_key)
     return rankings.percentile.mean(), rankings.percentile.median()
+
+
+def measure_performance_on_holdout_topics(topic_key, content_key=None, topics=topics, content=content, group="testing"):
+    # measure performance, but only for predictions made from topics that were never used as inputs during training
+    rankings = topics.rankings_by_content_id_to_parent(content, group, self_key=topic_key, other_key=content_key)
+    holdout_indices = []
+    for node in data.filter(lambda x: x.children and x.children[0].kind != "topic"):
+        groups = set(node.children.column("group"))
+        if "" not in groups:
+            for child in node.children:
+                if child.group == group:
+                    holdout_indices.append(child.index)
+
+    percentiles = rankings.loc[holdout_indices].percentile
+
+    return percentiles.mean(), percentiles.median()
+
+
+class Experiment(object):
+
+    def run(self, df=training_df, indices=None):
+        # should return a tuple with the embedding keys (topic and content)
+        pass
+
+    def name(self):
+        return self.__class__.__name__
+
+    def get_indices_for_group(self, df=dataframe, group="testing"):
+        content_indices = df[(df.group == group) & (df.kind != "topic")].index
+        parent_indices = df.loc[content_indices].parent_index
+        return parent_indices, content_indices        
+
+    def get_group_scores_with_parents(self, df=dataframe, group="testing", run=False):
+        parent_indices, content_indices = self.get_indices_for_group(df=df, group=group)
+        scores = self.get_sorted_pair_scores_for_group(df=df, group=group, run=run)
+        return scores.loc[zip(parent_indices, content_indices)].sort_values(by="score")
+
+    def get_scores_for_group(self, df=dataframe, group="testing", run=False):
+        parent_indices, content_indices = self.get_indices_for_group(df=df, group=group)
+        if run:
+            self.run(df, indices=list(parent_indices) + list(content_indices))
+        topic_key, content_key = self.get_output_keys()
+        topic_embeddings = embeddings[topic_key].loc[parent_indices]
+        content_embeddings = embeddings[content_key].loc[content_indices]
+        return topic_embeddings.dot(content_embeddings.T)
+
+    def get_sorted_pair_scores_for_group(self, df=dataframe, group="testing", run=False):
+        scores = self.get_scores_for_group(df=df, group=group, run=run).stack().sort_values(ascending=False).to_frame("score")
+        topic_indices, content_indices = zip(*scores.index)
+        scores["topic"] = data.by_indices(topic_indices)
+        scores["content"] = data.by_indices(content_indices)
+        return scores
+
+    def evaluate(self, df=dataframe, group="testing", run=False):
+        if run:
+            parent_indices, content_indices = self.get_indices_for_group(df=df, group=group)
+            self.run(df, indices=list(parent_indices.unique()) + list(content_indices))
+        topic_key, content_key = self.get_output_keys()
+        return measure_performance(topic_key, content_key=content_key, group=group)
+
+    def rankings(self, df=dataframe, group="testing", run=False):
+        if run:
+            self.run(df)
+        topic_key, content_key = self.get_output_keys()
+        return topics.rankings_by_content_id_to_parent(content, group, self_key=topic_key, other_key=content_key)
+
+    def rankings_by_channel_on_holdouts(self, df=dataframe):
+        rankings_t = self.rankings(df=df, group="testing")
+        rankings_v = self.rankings(df=df, group="validation")
+        rankings = rankings_t.append(rankings_v)
+        groups = rankings.groupby("channel")
+        by_channel = groups.mean().sort_values(by="channel").drop(["before", "after"], axis=1)
+        by_channel = by_channel.rename({"percentile": "percentile_mean"}, axis=1)
+        by_channel["percentile_median"] = groups.median().sort_values(by="channel").percentile
+        by_channel["counts"] = groups.channel.count()
+        by_channel["title"] = data.by_ids(by_channel.index).column("title")
+        return by_channel
+
+    def get_output_keys(self):
+        # should return a tuple with the embedding keys (for topics and content)
+        raise NotImplementedError()
+
+
+class TrainableExperiment(Experiment):
+
+    model = None
+
+    def train(self, df=dataframe, epochs=1, fraction=1):
+        
+        if self.model is None:
+            self.build_model()
+
+        x_training, y_training = self.prepare_data(df, group="", fraction=fraction)
+        x_validation, y_validation = self.prepare_data(df, group="validation")
+        x_testing, y_testing = self.prepare_data(df, group="testing")
+
+        self.model.fit(
+            x_training,
+            y_training,
+            epochs=epochs,
+            validation_data=(x_validation, y_validation),
+            callbacks=[self.get_tensorboard_callback(), self.get_checkpoint_callback()],
+        )
+
+        return self.model.evaluate(x_testing, y_testing, verbose=2)
+
+    def get_tensorboard_callback(self):
+        log_dir = "logs/fit/" + datetime.datetime.now().strftime("%Y%m%d-%H%M%S") + "-" + self.name()
+        return tf.keras.callbacks.TensorBoard(log_dir=log_dir, histogram_freq=1)
+
+    def get_checkpoint_callback(self):
+        return tf.keras.callbacks.ModelCheckpoint(f"saved_models/checkpoints/{self.name()}")
+
+    def saved_filename(self):
+        return f"saved_models/{self.name()}"
+
+    def save(self):
+        assert self.model
+        self.model.save(self.saved_filename())
+
+    def load(self):
+        self.model = tf.keras.models.load_model(self.saved_filename())
+
+    def run(self, df=dataframe, indices=None, chunk_size=10000):
+
+        assert self.model
+
+        if not indices:
+            indices = df.index
+
+        chunks = []
+
+        for indices_chunk in tqdm(grouper(chunk_size, indices), total=len(indices) / chunk_size):
+            inputs = self.prepare_inputs(df, indices_chunk)
+            chunks.append(self.model(inputs).numpy())
+        predictions = np.concatenate(chunks)
+        
+        output_key, _ = self.get_output_keys()
+        
+        embeddings[output_key] = pd.DataFrame(predictions, index=indices)
 
 
 

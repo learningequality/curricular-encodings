@@ -2,6 +2,7 @@ import json
 import numpy as np
 import pandas as pd
 import itertools
+from tqdm import tqdm
 
 from numpy.random import choice
 
@@ -14,6 +15,11 @@ def grouper(n, iterable):
         chunk = tuple(itertools.islice(it, n))
         if not chunk:
             return
+        yield chunk
+
+
+def node_grouper(n, iterable):
+    for chunk in grouper(n, iterable):
         yield NodeList(chunk)
 
 
@@ -46,8 +52,13 @@ class Node(object):
         return json.dumps(data, indent=2)
 
     def breadcrumbs(self, separator=" > "):
-        prefix = (self.parent.breadcrumbs(separator=separator) + separator) if self.parent else ""
-        return prefix + self.title
+        return separator.join(self.get_ancestors().column("title"))
+
+    def get_ancestors(self, include_self=False, _top=True):
+        ancestors = (self.parent.get_ancestors(include_self=True, _top=False) if self.parent else []) + ([self] if include_self else [])
+        if _top:
+            ancestors = NodeList(ancestors)
+        return ancestors
 
     def get_embedding(self, key):
         assert key in embeddings
@@ -55,6 +66,8 @@ class Node(object):
 
     def set_embedding(self, key, embedding):
         embeddings[key].loc[self.index] = embedding
+
+    # def get_ranked_matches
 
     def studio_url(self):
         if self.kind == "topic":
@@ -72,6 +85,9 @@ class NodeList(list):
 
     def by_indices(self, indices):
         return NodeList([self._by_index[index] for index in indices])
+
+    def by_index(self, index):
+        return self._by_index[index]
 
     def by_ids(self, ids):
         return NodeList([self._by_id[id] for id in ids])
@@ -105,11 +121,6 @@ class NodeList(list):
         scores = self.dot(other, self_key, other_key)
         return [other.by_indices(scores.loc[index].sort_values(ascending=False).index) for index in scores.index]
 
-    def ranked_matches_pd(self, other, self_key, other_key=None):
-        scores = self.dot(other, self_key, other_key)
-
-        return [other.by_indices(scores.loc[index].sort_values(ascending=False).index) for index in scores.index]
-
     def rankings_by_content_id_to_parent(self, other, group, self_key, other_key=None, chunk_size=1000):
         # self = all topics; other = test/holdout content nodes
 
@@ -120,7 +131,7 @@ class NodeList(list):
         rankings = []
 
         # chunk to keep the scores calculation from generating an OOM error
-        for chunk in grouper(chunk_size, other_grouped):
+        for chunk in tqdm(node_grouper(chunk_size, other_grouped), total=len(other_grouped) / chunk_size):
 
             chunk_indices = set(chunk.indices())
 
@@ -140,12 +151,16 @@ class NodeList(list):
 
         return pd.DataFrame(rankings, columns=["percentile", "before", "after", "channel", "language", "kind"], index=other_grouped.indices())
 
-    def ranked_matches_by_embedding(self, embedding, key, count=10, deduped=True):
+    def ranked_matches_for_embedding(self, embedding, key, count=10, deduped=True, kind=None, language=None):
         scores = embeddings[key].loc[self.indices()].dot(embedding.T)
-        matches = self.by_indices(scores.sort_values(ascending=False, by=0).index)
+        matches = self.by_indices(scores.sort_values(ascending=False).index)
         results = []
         content_ids = set()
         for match in matches:
+            if kind and kind != match.kind:
+                continue
+            if language and language != match.lang_id:
+                continue
             if deduped and match.content_id in content_ids:
                 continue
             content_ids.add(match.content_id)
@@ -172,4 +187,28 @@ class NodeList(list):
         embeddings[key] = pd.DataFrame(np.zeros((len(self), length), dtype=np.float32), index=self.indices())
 
     def as_dataframe(self):
-        return pd.DataFrame((node.fields for node in self), index=self.indices())
+        channels = []
+        kinds = []
+        dicts = []
+        for node in self:
+            d = {
+                "group": node.group or "",
+            }
+            d.update(node.fields)
+            if d["channel_id"] not in channels:
+                channels.append(d["channel_id"])
+            if d["kind"] not in kinds:
+                kinds.append(d["kind"])
+            d["channel_int"] = channels.index(d["channel_id"])
+            d["kind_int"] = kinds.index(d["kind"])
+            d["parent_index"] = node.parent.index if node.parent else -1
+            dicts.append(d)
+        df = pd.DataFrame(dicts, index=self.indices())
+       
+        int32_cols = ["lft", "rght", "parent_index"]
+        df[int32_cols] = df[int32_cols].astype(np.int32)
+        int16_cols = ["level", "kind_int", "channel_int"]
+        df[int16_cols] = df[int16_cols].astype(np.int16)
+
+        return df
+

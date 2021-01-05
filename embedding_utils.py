@@ -63,7 +63,14 @@ def get_embedder(model):
     # if model == "universal-sentence-encoder-cmlm/multilingual-base-br/1":
     #     return cmlm.encode_br
 
-    return hub.load(f"https://tfhub.dev/google/{model}")
+    return hub.KerasLayer(
+        f"https://tfhub.dev/google/{model}",
+        output_shape=[512],
+        input_shape=[],
+        dtype=tf.string,
+        trainable=False,
+        name=model_to_abbrev(model),
+    )
 
 
 def model_to_abbrev(model):
@@ -77,8 +84,6 @@ def model_to_abbrev(model):
 
 
 def embed(text, model=DEFAULT_MODEL, chunksize=DEFAULT_CHUNKSIZE, maxlength=200):
-    
-    embedder = get_embedder(model)
 
     abbrev = model_to_abbrev(model)
     
@@ -89,6 +94,9 @@ def embed(text, model=DEFAULT_MODEL, chunksize=DEFAULT_CHUNKSIZE, maxlength=200)
     for msg in text:
         if msg not in embedding_cache[abbrev]:
             to_embed.append(msg)
+
+    if len(to_embed) > 0:
+        embedder = get_embedder(model)
 
     for i in range(0, len(to_embed), chunksize):
         chunk = to_embed[i:i+chunksize]

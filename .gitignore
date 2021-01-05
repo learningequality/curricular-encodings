@@ -134,3 +134,5 @@ KOLIBRI_DATA
 data/
 *.pickle
 kolibri/
+logs/
+saved_models/
