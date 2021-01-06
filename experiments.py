@@ -14,6 +14,16 @@ class RawTitleComparison(Experiment):
         return f"title_{MODEL}", f"title_{MODEL}"
 
 
+class RawTitleDescriptionComparison(Experiment):
+
+    def run(self, df=training_df, indices=None):
+        pass
+
+    def get_output_keys(self):
+        # should return a tuple with the embedding keys (for topics and content)
+        return f"title_description_{MODEL}", f"title_description_{MODEL}"
+
+
 class BottomUpTopDownTitles(Experiment):
 
     def run(self, df=training_df, indices=None):
@@ -21,7 +31,7 @@ class BottomUpTopDownTitles(Experiment):
         source_key = f"title_{MODEL}"
         bu_key = f"bu_title_{MODEL}"
         td_bu_key = f"td_bu_title_{MODEL}"
-        
+
         # do the bottom-up pass
         if bu_key not in embeddings:
             print("Cloning embedding for doing bottom-up pass...")
@@ -45,14 +55,13 @@ class BottomUpTopDownTitles(Experiment):
         return td_bu_key, source_key
 
 
-
 class PredictContentTitlesFromParentTitles(TrainableExperiment):
 
     input_key = f"title_{MODEL}"
     target_key = f"parent_title_prediction_{MODEL}"
 
     def prepare_data(self, df, group, fraction=1):
-        
+
         content_indices = df[(df.group == group) & (df.kind != "topic")].sample(frac=fraction).index
         parent_indices = df.loc[content_indices].parent_index
 
@@ -85,7 +94,7 @@ class PredictContentTitlesFromParentTitles(TrainableExperiment):
 
     def get_output_keys(self):
         # should return a tuple with the embedding keys (for topics and content)
-        return self.target_key, self.input_key        
+        return self.target_key, self.input_key
 
 
 # class PredictContentTitlesFromParentAndSiblingTitles(PredictContentTitlesFromParentTitles):
@@ -358,16 +367,154 @@ class PredictContentTitlesAndDescriptionsFromAncestorTitlesAndDescriptionsNoChan
             inputs = self.prepare_inputs(df, indices_chunk)
             outputs_titles, outputs_descriptions = self.model(inputs)
             chunks.append(np.concatenate((outputs_titles.numpy(), outputs_descriptions.numpy()), axis=1))
-        
+
         predictions = np.concatenate(chunks)
-        
+
         output_key, _ = self.get_output_keys()
-        
+
         embeddings[output_key] = pd.DataFrame(predictions, index=indices)
 
 
 
+class ParentLearnedEncoding(PredictContentTitlesFromParentTitles):
+
+    title_key = f"title_{MODEL}"
+    description_key = f"description_{MODEL}"
+    target_key = f"parent_learned_encoding_{MODEL}"
+    shared_encoder_layers = None
+
+    def build_shared_encoder_layers(self):
+        if self.shared_encoder_layers is None:
+            self.shared_encoder_layers = {
+                "language_embedding": tf.keras.layers.Embedding(len(languages), 16, name="language_embedding"),
+                "kind_embedding": tf.keras.layers.Embedding(len(content_kinds), 8, name="kind_embedding"),
+                "hidden_layer": tf.keras.layers.Dense(256, activation="relu", name="hidden_layer"),
+                "prenorm_output": tf.keras.layers.Dense(512, name="prenorm_output"),
+            }
+
+    def get_encoder_network(self, prefix=""):
+
+        self.build_shared_encoder_layers()
+
+        title_input = tf.keras.layers.Input(512, name=f"{prefix}title_input")
+        description_input = tf.keras.layers.Input(512, name=f"{prefix}description_input")
+        language_input = tf.keras.layers.Input(1, name=f"{prefix}language_input")
+        kind_input = tf.keras.layers.Input(1, name=f"{prefix}kind_input")
+
+        language_embedding = self.shared_encoder_layers["language_embedding"](language_input)
+        kind_embedding = self.shared_encoder_layers["kind_embedding"](kind_input)
+
+        flat_language_embedding = tf.keras.layers.Flatten(name=f"{prefix}language_flattener")(language_embedding)
+        flat_kind_embedding = tf.keras.layers.Flatten(name=f"{prefix}kind_flattener")(kind_embedding)
+
+        x = tf.keras.layers.Concatenate(axis=1, name=f"{prefix}input_concatenation")([title_input, description_input, flat_language_embedding, flat_kind_embedding])
+        x = self.shared_encoder_layers["hidden_layer"](x)
+        x = tf.keras.layers.Dropout(0.2, name=f"{prefix}dropout")(x)
+        x = self.shared_encoder_layers["prenorm_output"](x)
+
+        output = tf.keras.layers.Lambda(lambda val: tf.math.l2_normalize(val, axis=1), name=f"{prefix}encoding")(x)
+
+        inputs = {
+            f"{prefix}title_input": title_input,
+            f"{prefix}description_input": description_input,
+            f"{prefix}language_input": language_input,
+            f"{prefix}kind_input": kind_input,
+        }
+
+        return inputs, output
+
+    def get_comparer_model(self):
+
+        inputs_parent, output_parent = self.get_encoder_network("parent_")
+        inputs_child, output_child = self.get_encoder_network("child_")
+
+        compare = tf.keras.layers.Dot(axes=1)([output_parent, output_child])
+
+        all_inputs = {}
+        all_inputs.update(inputs_parent)
+        all_inputs.update(inputs_child)
+
+        return tf.keras.Model(
+            inputs=all_inputs,
+            outputs=[compare],
+        )
+
+    def get_encoder_model(self):
+
+        inputs, output = self.get_encoder_network()
+
+        return tf.keras.Model(
+            inputs=inputs,
+            outputs=[output],
+        )
+
+    def create_input_dict(self, indices, df=dataframe, prefix=""):
+        if isinstance(indices, tuple):
+            indices = list(indices)
+        return {
+            f"{prefix}title_input": embeddings[self.title_key].loc[indices],
+            f"{prefix}description_input": embeddings[self.description_key].loc[indices],
+            f"{prefix}language_input": np.array(dataframe.language_int[indices]).reshape(len(indices), 1),
+            f"{prefix}kind_input": np.array(dataframe.kind_int[indices]).reshape(len(indices), 1),
+        }
+
+    def prepare_data(self, df, group, fraction=1):
+
+        content_indices = df[(df.group == group) & (df.kind != "topic")].sample(frac=fraction).index
+        parent_indices = df.loc[content_indices].parent_index
+
+        inputs = self.prepare_training_inputs(df, parent_indices, target_indices=content_indices)
+        outputs = self.prepare_outputs(df, content_indices)
+
+        return inputs, outputs
+
+    def prepare_training_inputs(self, df, indices, target_indices=None):
+        all_inputs = self.create_input_dict(indices, df=df, prefix="parent_")
+        all_inputs.update(self.create_input_dict(target_indices, df=df, prefix="child_"))
+        return all_inputs
+
+    def prepare_inputs(self, df, indices, target_indices=None):
+        return self.create_input_dict(indices, df=df)
+
+    def prepare_outputs(self, df, indices):
+        return np.ones((len(indices), 1))
+
+    def build_model(self):
+        self.encoder = self.get_encoder_model()
+        self.model = self.get_comparer_model()
+
+        self.model.compile(
+            optimizer="adam",
+            loss=tf.keras.losses.MeanSquaredError(),
+            metrics=[lambda y_true, y_pred: tf.reduce_mean(y_pred, axis=-1)],
+        )
+
+    def get_output_keys(self):
+        # should return a tuple with the embedding keys (for topics and content)
+        return self.target_key, self.target_key
+
+    def run(self, df=dataframe, indices=None, chunk_size=10000):
+
+        assert self.encoder
+
+        if not indices:
+            indices = df.index
+
+        chunks = []
+
+        for indices_chunk in tqdm(grouper(chunk_size, indices), total=len(indices) / chunk_size):
+            inputs = self.prepare_inputs(df, indices_chunk)
+            output_chunk = self.encoder(inputs).numpy()
+            chunks.append(output_chunk)
+
+        predictions = np.concatenate(chunks)
+
+        output_key, _ = self.get_output_keys()
+
+        embeddings[output_key] = pd.DataFrame(predictions, index=indices)
+
+
 #e = PredictContentTitlesFromParentTitles()
-e = PredictContentTitlesAndDescriptionsFromAncestorTitlesAndDescriptionsNoChannel()
+e = ParentLearnedEncoding()
 # e.build_model()
 #e.train()

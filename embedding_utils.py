@@ -63,6 +63,15 @@ def get_embedder(model):
     # if model == "universal-sentence-encoder-cmlm/multilingual-base-br/1":
     #     return cmlm.encode_br
 
+    return hub.load(f"https://tfhub.dev/google/{model}")
+
+
+@lru_cache
+def get_embedder_layer(model, trainable=False):
+
+    if "/" not in model:
+        return get_embedder(abbrev_to_model[model])
+
     return hub.KerasLayer(
         f"https://tfhub.dev/google/{model}",
         output_shape=[512],

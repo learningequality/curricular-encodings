@@ -40,9 +40,13 @@ class Experiment(object):
         return parent_indices, content_indices        
 
     def get_group_scores_with_parents(self, df=dataframe, group="testing", run=False):
+        topic_key, content_key = self.get_output_keys()
         parent_indices, content_indices = self.get_indices_for_group(df=df, group=group)
-        scores = self.get_sorted_pair_scores_for_group(df=df, group=group, run=run)
-        return scores.loc[zip(parent_indices, content_indices)].sort_values(by="score")
+        parent_embeddings = embeddings[topic_key].loc[parent_indices]
+        content_embeddings = embeddings[content_key].loc[content_indices]
+        scores = (np.array(parent_embeddings) * np.array(content_embeddings)).sum(axis=1)
+        index = pd.MultiIndex.from_tuples(zip(parent_indices, content_indices), names=["topic", "content"])
+        return pd.Series(scores, index=index, name="score").sort_values()
 
     def get_scores_for_group(self, df=dataframe, group="testing", run=False):
         parent_indices, content_indices = self.get_indices_for_group(df=df, group=group)

@@ -1,11 +1,17 @@
+import pandas as pd
+import numpy as np
 import json
-from classes import Node, NodeList
+import requests
+from le_utils.constants import languages as le_utils_languages
+from le_utils.constants import content_kinds as le_utils_content_kinds
 
 DEFAULT_FILENAME = "metadatadump.json"
 
 def load_data(filename=DEFAULT_FILENAME):
 
     print("Loading data... ", end="")
+
+    from classes import Node, NodeList
 
     with open(filename) as f:
         data = {key: Node(fields) for key, fields in json.load(f).items()}
@@ -27,5 +33,17 @@ def load_data(filename=DEFAULT_FILENAME):
 
     return NodeList(data.values())
 
-if __name__ == "__main__":
-    data = load_data()
+
+def load_languages():
+    return list({l.primary_code: l for l in le_utils_languages.LANGUAGELIST}.keys())
+
+
+def load_content_kinds():
+    return list({k.id: k for k in le_utils_content_kinds.KINDLIST}.keys())
+
+languages = load_languages()
+language_lookup = pd.Series(range(len(languages)), index=languages, dtype=np.uint16)
+language_lookup[None] = language_lookup["und"]
+
+content_kinds = load_content_kinds()
+kind_lookup = pd.Series(range(len(content_kinds)), index=content_kinds, dtype=np.uint8)

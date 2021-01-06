@@ -1,5 +1,13 @@
-tensorflow-gpu<2.4
-tensorflow-hub<2.4
+tensorflow-gpu==2.4
+tensorflow-hub
+tensorflow_text
+requests
 jupyter
 matplotlib
 seaborn
+numpy
+scikit-learn
+ipython==7.13
+jedi==0.17.2
+tqdm
+le-utils==0.1.26

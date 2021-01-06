@@ -7,6 +7,7 @@ from tqdm import tqdm
 from numpy.random import choice
 
 from embedding_utils import embeddings
+from dataloading import *
 
 
 def grouper(n, iterable):
@@ -188,7 +189,6 @@ class NodeList(list):
 
     def as_dataframe(self):
         channels = []
-        kinds = []
         dicts = []
         for node in self:
             d = {
@@ -197,10 +197,9 @@ class NodeList(list):
             d.update(node.fields)
             if d["channel_id"] not in channels:
                 channels.append(d["channel_id"])
-            if d["kind"] not in kinds:
-                kinds.append(d["kind"])
             d["channel_int"] = channels.index(d["channel_id"])
-            d["kind_int"] = kinds.index(d["kind"])
+            d["kind_int"] = kind_lookup[d["kind"]]
+            d["language_int"] = language_lookup[d["lang_id"]]
             d["parent_index"] = node.parent.index if node.parent else -1
             dicts.append(d)
         df = pd.DataFrame(dicts, index=self.indices())
