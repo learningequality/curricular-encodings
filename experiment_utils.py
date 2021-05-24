@@ -134,6 +134,10 @@ class TrainableExperiment(Experiment):
     def load(self):
         self.model = tf.keras.models.load_model(self.saved_filename())
 
+    def prepare_training_inputs(self, *args, **kwargs):
+        # in case it's not overridden
+        return self.prepare_inputs(*args, **kwargs)
+
     def run(self, df=dataframe, indices=None, chunk_size=10000):
 
         assert self.model
